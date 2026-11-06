@@ -1,0 +1,39 @@
+# Конфигурация Briefcase — только для сборки Android-приложения (APK).
+# Настольные версии собираются PyInstaller'ом из app.py (см. build.bat, build.sh, .github/workflows/build.yml).
+
+[tool.briefcase]
+project_name = "Relay Connect"
+bundle = "ru.relayconnect"
+version = "1.0.0"
+license = "LicenseRef-Proprietary"
+author = "Relay Connect"
+
+[tool.briefcase.app.relay_connect]
+formal_name = "Relay Connect"
+description = "Обход блокировки IPv4 VPN-сервера через российский VPS по IPv6"
+long_description = "Настраивает пересылку RU(IPv4) → зарубежный сервер (IPv6) для AmneziaWG и переделывает клиентские ключи."
+sources = ["src/relay_connect"]
+requires = [
+    "paramiko>=3.4,<4",
+    "certifi",
+]
+
+[tool.briefcase.app.relay_connect.android]
+# Бинарные зависимости paramiko — версии, для которых у Chaquopy есть Android-сборки под Python 3.12
+requires = [
+    "toga-android~=0.5.7",
+    "cryptography==42.0.8",
+    "bcrypt==3.2.2",
+    "pynacl==1.5.0",
+]
+min_os_version = "24"
+
+# Для запуска Toga-версии на компьютере через `briefcase dev` (не обязательно)
+[tool.briefcase.app.relay_connect.windows]
+requires = ["toga-winforms~=0.5.7"]
+
+[tool.briefcase.app.relay_connect.macOS]
+requires = ["toga-cocoa~=0.5.7", "std-nslog~=1.0.3"]
+
+[tool.briefcase.app.relay_connect.linux]
+requires = ["toga-gtk~=0.5.7"]

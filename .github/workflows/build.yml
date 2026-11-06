@@ -1,0 +1,123 @@
+# Сборка Relay Connect под все платформы.
+# - при каждом пуше и вручную (Actions → build → Run workflow): файлы появляются во вкладке Artifacts запуска;
+# - при пуше тега вида v1.0.0: дополнительно создаётся GitHub Release со всеми файлами.
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-latest }
+          - { name: macos, os: macos-latest }   # Apple Silicon (arm64)
+          - { name: linux, os: ubuntu-22.04 }   # старый glibc — бинарник запустится на большинстве дистрибутивов
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build (Windows)
+        if: matrix.name == 'windows'
+        shell: bash
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name RelayConnect --paths src app.py
+          mv dist/RelayConnect.exe dist/RelayConnect-windows.exe
+
+      - name: Build (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --name RelayConnect --paths src app.py
+          ditto -c -k --keepParent dist/RelayConnect.app dist/RelayConnect-macos-arm64.zip
+
+      - name: Build (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name RelayConnect --paths src app.py
+          chmod +x dist/RelayConnect
+          tar -C dist -czf dist/RelayConnect-linux-x86_64.tar.gz RelayConnect
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RelayConnect-${{ matrix.name }}
+          path: |
+            dist/RelayConnect-windows.exe
+            dist/RelayConnect-macos-arm64.zip
+            dist/RelayConnect-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # для этой версии у Chaquopy есть сборки cryptography/bcrypt/pynacl
+
+      - name: Use JDK 17
+        run: echo JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME_17_arm64}" | tee -a "${GITHUB_ENV}"
+
+      - name: Install Briefcase
+        run: python -m pip install "briefcase==0.4.7"
+
+      - name: Create Android project
+        run: briefcase create android --no-input --log
+
+      - name: Build
+        run: briefcase build android --no-input --log
+
+      - name: Package debug APK
+        run: |
+          briefcase package android -p debug-apk --no-input --log
+          apk="$(find dist -name '*.apk' | head -n 1)"
+          test -n "$apk" || { echo "APK не найден"; ls -R dist; exit 1; }
+          cp "$apk" dist/RelayConnect-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RelayConnect-android
+          path: dist/RelayConnect-android.apk
+          if-no-files-found: error
+
+      - name: Upload Briefcase logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: briefcase-logs
+          path: logs/
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: RelayConnect-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
