@@ -2,8 +2,9 @@
 Relay Connect — настольная версия (Windows, macOS, Linux), tkinter.
 
 Вводишь IPv4 российского сервера, IPv6 зарубежного, root-пароли —
-программа сама настраивает пересылку RU(IPv4) → DE(IPv6) для Amnezia
-и выдаёт новые ключи (обычные и админские) уже с адресом RU-сервера.
+программа сама настраивает пересылку RU(IPv4) → DE(IPv6) для AmneziaWG
+(amneziawg-installer или Amnezia в docker; если нет ни того, ни другого — предлагает поставить
+amneziawg-installer) и выдаёт ключи клиентов с адресом RU-сервера.
 Android-версия лежит в src/relay_connect/mobile.py и использует то же ядро.
 """
 
@@ -29,6 +30,7 @@ from relay_connect.config_patch import PatchError, patch_any  # noqa: E402
 APP_TITLE = "Relay Connect — обход блокировки IPv4 через RU-сервер"
 COLORS = {"info": "#222222", "ok": "#1a7f37", "warn": "#9a6700", "err": "#cf222e", "step": "#0550ae"}
 PREFIX = {"ok": "✔ ", "warn": "⚠ ", "err": "✖ ", "step": "\n▶ "}
+KEY_ACTIONS = ("userkey", "showkey", "adminkey")
 ADMIN_WARNING = (
     "В админском ключе лежит root-пароль зарубежного сервера. Кто получит ключ, "
     "получит полный доступ к серверу. Не пересылай его в чаты и никому не отдавай.\n\n"
@@ -61,6 +63,7 @@ class App(tk.Tk):
         self.buttons: list[ttk.Button] = []
         self._active_log: scrolledtext.ScrolledText | None = None
         self._user_key: keys.UserKey | None = None
+        self._key_kind = "user"   # что сейчас в поле ключа: user или admin
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
@@ -104,7 +107,6 @@ class App(tk.Tk):
             "de_host", "de_port", "de_user", "de_pass", "ports", "ssh_fwd")}
         self.v["ru_port"].set("22"); self.v["de_port"].set("22")
         self.v["ru_user"].set("root"); self.v["de_user"].set("root")
-        self.v["ssh_fwd"].set("2222")
 
         ru = ttk.LabelFrame(f, text=" Российский сервер (вход, к нему подключаются клиенты) ")
         ru.grid(row=0, column=0, sticky="we", padx=4, pady=4)
@@ -114,7 +116,7 @@ class App(tk.Tk):
         self._field(ru, 2, "Логин", self.v["ru_user"], width=16)
         self._field(ru, 3, "Пароль", self.v["ru_pass"], show="•")
 
-        de = ttk.LabelFrame(f, text=" Зарубежный сервер (выход, там стоит Amnezia) ")
+        de = ttk.LabelFrame(f, text=" Зарубежный сервер (выход: AmneziaWG — или программа его поставит) ")
         de.grid(row=1, column=0, sticky="we", padx=4, pady=4)
         de.columnconfigure(1, weight=1)
         self._field(de, 0, "IPv6-адрес", self.v["de_host"], hint="например 2a01:4f8:c0c:1234::2")
@@ -125,10 +127,10 @@ class App(tk.Tk):
         pf = ttk.LabelFrame(f, text=" Порты ")
         pf.grid(row=2, column=0, sticky="we", padx=4, pady=4)
         pf.columnconfigure(1, weight=1)
-        self._field(pf, 0, "Порты Amnezia", self.v["ports"],
-                    hint="пусто = найти сами;\nили вручную: 51820/udp, 443/tcp")
+        self._field(pf, 0, "Порты AmneziaWG", self.v["ports"],
+                    hint="пусто = найти на сервере;\nили вручную: 39743/udp, 443/tcp")
         self._field(pf, 1, "SSH-проброс", self.v["ssh_fwd"], width=8,
-                    hint="порт на RU-сервере для админского ключа;\nпусто = не нужен")
+                    hint="порт на RU-сервере для SSH к зарубежному и\nадминского ключа (например 2222); пусто = не нужен")
 
         bf = ttk.Frame(f)
         bf.grid(row=3, column=0, sticky="we", padx=4, pady=6)
@@ -148,21 +150,29 @@ class App(tk.Tk):
         nb.add(f, text="  Ключи  ")
         f.columnconfigure(0, weight=1)
         ttk.Label(f, wraplength=820, justify="left", text=(
-            "Новые ключи создаются прямо на зарубежном сервере (через RU-сервер) и сразу содержат адрес "
-            "RU-сервера. Данные серверов берутся с вкладки «Настройка». Каждому устройству — свой ключ."
+            "Ключи создаются прямо на зарубежном сервере (программа заходит туда через RU-сервер) и сразу "
+            "ведут на RU-сервер. Для amneziawg-installer клиентов создаёт manage_amneziawg.sh, для Amnezia "
+            "в docker пользователь дописывается в контейнер. Данные серверов берутся с вкладки «Настройка». "
+            "Каждому устройству — свой ключ."
         )).grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
-        uf = ttk.LabelFrame(f, text=" Обычный ключ — для нового устройства ")
+        uf = ttk.LabelFrame(f, text=" Клиент ")
         uf.grid(row=1, column=0, sticky="we", padx=4, pady=4)
         uf.columnconfigure(1, weight=1)
-        self.key_name = tk.StringVar(value="Телефон")
-        self._field(uf, 0, "Имя пользователя", self.key_name, width=28, hint="так он будет называться в Amnezia")
-        self._button(uf, "Создать обычный ключ", "userkey").grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self.key_name = tk.StringVar(value="phone")
+        self._field(uf, 0, "Имя клиента", self.key_name, width=28,
+                    hint="для amneziawg-installer: латиница, цифры, - и _\n(кириллицу программа переведёт)")
+        bb = ttk.Frame(uf)
+        bb.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self._button(bb, "Создать нового клиента", "userkey").pack(side="left")
+        self._button(bb, "Показать ключ существующего", "showkey").pack(side="left", padx=8)
+        ttk.Label(uf, foreground="#666", text="«Показать ключ существующего» — только для amneziawg-installer: "
+                  "Amnezia в docker не хранит ключи на сервере.").grid(row=2, column=1, sticky="w", padx=6)
 
-        af = ttk.LabelFrame(f, text=" Админский ключ — полный доступ к серверу из приложения Amnezia ")
+        af = ttk.LabelFrame(f, text=" Админский ключ — только для Amnezia в docker ")
         af.grid(row=2, column=0, sticky="we", padx=4, pady=4)
         ttk.Label(af, wraplength=800, justify="left", foreground="#9a6700", text=(
-            "Приложение будет управлять сервером через SSH-проброс на RU-сервере, а все ключи, которые оно "
+            "Приложение Amnezia будет управлять сервером через SSH-проброс на RU-сервере, а все ключи, которые оно "
             "создаст через «Поделиться», сразу будут с адресом RU-сервера. Внутри ключа root-пароль "
             "зарубежного сервера: никому его не отдавай. Нужен включённый SSH-проброс (вкладка «Настройка»)."
         )).pack(anchor="w", padx=6, pady=(4, 2))
@@ -175,9 +185,9 @@ class App(tk.Tk):
         top = ttk.Frame(of)
         top.grid(row=0, column=0, sticky="we", padx=4, pady=2)
         self.key_format = tk.StringVar(value="vpn")
-        self.fmt_vpn = ttk.Radiobutton(top, text="Ключ vpn://", value="vpn", variable=self.key_format,
+        self.fmt_vpn = ttk.Radiobutton(top, text="vpn:// (Amnezia VPN)", value="vpn", variable=self.key_format,
                                        command=self._show_key)
-        self.fmt_conf = ttk.Radiobutton(top, text="Файл .conf", value="conf", variable=self.key_format,
+        self.fmt_conf = ttk.Radiobutton(top, text=".conf (AmneziaWG)", value="conf", variable=self.key_format,
                                         command=self._show_key)
         self.fmt_vpn.pack(side="left")
         self.fmt_conf.pack(side="left", padx=8)
@@ -193,7 +203,6 @@ class App(tk.Tk):
         self.key_log.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
         f.rowconfigure(3, weight=1)
         f.rowconfigure(4, weight=1)
-        self._key_kind = "user"
 
     def _build_patch(self, nb):
         f = ttk.Frame(nb)
@@ -201,10 +210,11 @@ class App(tk.Tk):
         f.columnconfigure(0, weight=1)
 
         ttk.Label(f, wraplength=800, justify="left", text=(
-            "Для уже существующих ключей. В приложении Amnezia открой сервер → «Поделиться» → «Ключ Amnezia» "
-            "(vpn://…) или «Нативный формат AmneziaWG» (.conf). Вставь сюда — программа заменит адрес "
-            "зарубежного сервера на адрес RU-сервера. Потом импортируй результат в Amnezia "
-            "как новое подключение.")).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+            "Для ключей, которые уже есть на руках (vpn://… или .conf). Вставь сюда — программа заменит адрес "
+            "зарубежного сервера на адрес RU-сервера. Потом импортируй результат как новое подключение. "
+            "Для amneziawg-installer проще взять перевыпущенный ключ на вкладке «Ключи» кнопкой «Показать ключ "
+            "существующего»: там адрес RU-сервера уже стоит везде, где нужно. Для Amnezia в docker старый ключ "
+            "возьми в приложении: «Поделиться» → «Ключ Amnezia» или «Нативный формат AmneziaWG».")).grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
         top = ttk.Frame(f)
         top.grid(row=1, column=0, sticky="we", padx=6)
@@ -275,7 +285,7 @@ class App(tk.Tk):
                 if item[0] == "log":
                     _, box, msg, level = item
                     self._write_log(box or self.log_box, msg, level)
-                    if box is self.key_log and level in ("step", "err", "ok"):
+                    if box is self.key_log and level in ("step", "err", "ok") and msg.strip():
                         self.key_status.configure(text=msg.strip()[:80], foreground=COLORS[level])
                 elif item[0] == "done":
                     self._done(item[1], item[2])
@@ -287,25 +297,35 @@ class App(tk.Tk):
         self._set_busy(False)
         if not result:
             return
-        if action == "setup":
+        if isinstance(result, core.AwgMissing):
+            # «Настроить» не нашёл AmneziaWG: спрашиваем, ставить ли, и продолжаем с того же журнала
+            if messagebox.askyesno("Установить AmneziaWG?", core.install_question(result), icon="warning"):
+                self._start("install", clear_log=False)
+            return
+        if action in ("setup", "install"):
             self.new_host.set(result)
             messagebox.showinfo("Готово", f"Relay настроен.\nНовый адрес для клиентов: {result}\n\n"
                                 "Новые ключи для устройств выдаются на вкладке «Ключи».")
             self.nb.select(1)
-        elif action == "userkey":
-            self._user_key = result
-            self._key_kind = "user"
-            self.fmt_vpn.configure(state="normal")
-            self.fmt_conf.configure(state="normal")
-            self._show_key()
-            self.key_status.configure(text=f"✔ Ключ «{result.name}» готов ({result.ip})", foreground=COLORS["ok"])
         elif action == "adminkey":
             self._key_kind = "admin"
             self.key_format.set("vpn")
+            self.fmt_vpn.configure(state="normal")
             self.fmt_conf.configure(state="disabled")
             self.key_out.delete("1.0", "end")
             self.key_out.insert("1.0", result)
             self.key_status.configure(text="✔ Админский ключ готов — никому его не отдавай", foreground=COLORS["warn"])
+        elif action in KEY_ACTIONS:
+            self._user_key = result
+            self._key_kind = "user"
+            self.fmt_conf.configure(state="normal")
+            if result.vpn:
+                self.fmt_vpn.configure(state="normal")
+            else:
+                self.key_format.set("conf")
+                self.fmt_vpn.configure(state="disabled")
+            self._show_key()
+            self.key_status.configure(text=f"✔ Ключ «{result.name}» готов ({result.ip})", foreground=COLORS["ok"])
 
     def _set_busy(self, busy: bool):
         self.busy = busy
@@ -337,7 +357,7 @@ class App(tk.Tk):
             ssh_forward=port("ssh_fwd", allow_empty=True),
         )
 
-    def _start(self, action: str):
+    def _start(self, action: str, clear_log: bool = True):
         if self.busy:
             return
         try:
@@ -356,9 +376,10 @@ class App(tk.Tk):
             if not messagebox.askyesno("Админский ключ", ADMIN_WARNING, icon="warning"):
                 return
         self._save_settings()
-        box = self.key_log if action in ("userkey", "adminkey") else self.log_box
+        box = self.key_log if action in KEY_ACTIONS else self.log_box
         self._active_log = box
-        box.configure(state="normal"); box.delete("1.0", "end"); box.configure(state="disabled")
+        if clear_log:
+            box.configure(state="normal"); box.delete("1.0", "end"); box.configure(state="disabled")
         self._set_busy(True)
         threading.Thread(target=self._worker, args=(action, p, self.key_name.get()), daemon=True).start()
 
@@ -368,11 +389,20 @@ class App(tk.Tk):
             if action == "check":
                 core.run_check(p, self.log)
             elif action == "setup":
+                try:
+                    result, _ = core.run_setup(p, self.log)
+                except core.AwgMissing as e:
+                    self.log(str(e), "warn")
+                    result = e
+            elif action == "install":
+                core.install_awg(p, self.log)
                 result, _ = core.run_setup(p, self.log)
             elif action == "remove":
                 core.run_remove(p, self.log)
             elif action == "userkey":
                 result = keys.create_user_key(p, key_name, self.log)
+            elif action == "showkey":
+                result = keys.get_user_key(p, key_name, self.log)
             elif action == "adminkey":
                 result = keys.build_admin_key(p, p.ssh_forward, self.log)
         except core.RelayError as e:
@@ -388,7 +418,8 @@ class App(tk.Tk):
     def _show_key(self):
         if self._key_kind != "user" or not self._user_key:
             return
-        text = self._user_key.vpn if self.key_format.get() == "vpn" else self._user_key.conf
+        k = self._user_key
+        text = k.vpn if self.key_format.get() == "vpn" and k.vpn else k.conf
         self.key_out.delete("1.0", "end")
         self.key_out.insert("1.0", text)
 
@@ -396,9 +427,8 @@ class App(tk.Tk):
         out = self.key_out.get("1.0", "end").strip()
         if not out:
             return
-        is_conf = self._key_kind == "user" and self.key_format.get() == "conf"
-        ext = ".conf" if is_conf else ".vpn"
-        name = (self._user_key.name if self._key_kind == "user" and self._user_key else "admin")
+        ext = ".vpn" if out.startswith("vpn://") else ".conf"
+        name = self._user_key.name if self._key_kind == "user" and self._user_key else "admin"
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name) or "key"
         path = filedialog.asksaveasfilename(defaultextension=ext, initialfile=f"{safe}{ext}")
         if path:

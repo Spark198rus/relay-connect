@@ -21,13 +21,14 @@ from . import relay_core as core
 from .config_patch import PatchError, patch_any
 
 PREFIX = {"ok": "✔ ", "warn": "⚠ ", "err": "✖ ", "step": "\n▶ "}
+KEY_ACTIONS = ("userkey", "showkey", "adminkey")
 SAVED_FIELDS = ("ru_host", "ru_port", "ru_user", "de_host", "de_port", "de_user", "ports", "ssh_fwd")  # без паролей
 
 
 class RelayConnect(toga.App):
     def startup(self):
         self.busy = False
-        self._active = "setup"   # какая операция пишет в журнал: setup/check/remove или userkey/adminkey
+        self._active = "setup"   # какая операция пишет в журнал: setup/check/remove/install или userkey/showkey/adminkey
         self.inputs: dict[str, toga.Widget] = {}
 
         self.user_key: keys.UserKey | None = None
@@ -83,14 +84,14 @@ class RelayConnect(toga.App):
             self._field("ru_user", "Логин", value="root"),
             self._field("ru_pass", "Пароль", password=True),
             self._title("Зарубежный сервер"),
-            self._hint("Выход: там стоит Amnezia"),
+            self._hint("Выход: AmneziaWG (amneziawg-installer или Amnezia в docker). Если его нет, программа предложит поставить"),
             self._field("de_host", "IPv6-адрес", "2a01:4f8:c0c:1234::2"),
             self._field("de_port", "SSH-порт", value="22"),
             self._field("de_user", "Логин", value="root"),
             self._field("de_pass", "Пароль", password=True),
             self._title("Порты"),
-            self._field("ports", "Пусто = найти порты Amnezia автоматически", "51820/udp, 443/tcp"),
-            self._field("ssh_fwd", "SSH-проброс для админского ключа (пусто = не нужен)", value="2222"),
+            self._field("ports", "Пусто = найти порты AmneziaWG на сервере", "39743/udp, 443/tcp"),
+            self._field("ssh_fwd", "SSH-проброс к зарубежному серверу через RU, нужен и для админского ключа (пусто = не нужен)", "2222"),
             toga.Box(children=[self.btn_check, self.btn_setup], style=Pack(direction=ROW, gap=8, margin=(12, 0, 4, 0))),
             self.btn_remove,
             self.status,
@@ -105,9 +106,9 @@ class RelayConnect(toga.App):
         self.patch_status = toga.Label("", style=Pack(margin=(6, 0)))
         return toga.Box(style=Pack(direction=COLUMN, margin=(0, 12, 24, 12)), children=[
             self._title("Переделать ключ клиента"),
-            self._hint("В Amnezia: сервер → «Поделиться» → «Ключ Amnezia». "
-                       "Скопируй ключ, вставь ниже и нажми «Преобразовать». "
-                       "Готовый ключ скопируй и импортируй в Amnezia как новое подключение."),
+            self._hint("Для ключей, которые уже есть на руках (vpn://… или .conf). Вставь ключ ниже и нажми "
+                       "«Преобразовать», готовый импортируй как новое подключение. Для amneziawg-installer проще "
+                       "взять перевыпущенный ключ в разделе «Ключи» кнопкой «Показать ключ существующего»."),
             self._field("new_host", "Новый адрес (IPv4 RU-сервера)", "185.10.20.30"),
             self._field("old_host", "Старый адрес (пусто = определить самому)"),
             toga.Label("Исходный ключ", style=Pack(font_size=12, margin=(8, 0, 2, 0))),
@@ -123,7 +124,9 @@ class RelayConnect(toga.App):
         ])
 
     def _build_keys(self) -> toga.Box:
-        self.btn_userkey = toga.Button("Создать обычный ключ", on_press=self.on_userkey, style=Pack(margin=(6, 0)))
+        self.btn_userkey = toga.Button("Создать нового клиента", on_press=self.on_userkey, style=Pack(margin=(6, 0)))
+        self.btn_showkey = toga.Button("Показать ключ существующего", on_press=self.on_showkey,
+                                       style=Pack(margin=(6, 0)))
         self.btn_adminkey = toga.Button("Создать админский ключ", on_press=self.on_adminkey, style=Pack(margin=(6, 0)))
         self.key_status = toga.Label("", style=Pack(margin=(6, 0)))
         self.key_out = toga.MultilineTextInput(readonly=True, placeholder="Здесь появится ключ",
@@ -132,12 +135,15 @@ class RelayConnect(toga.App):
                                         style=Pack(margin=(4, 0)))
         self.key_log = toga.MultilineTextInput(readonly=True, placeholder="Журнал", style=Pack(height=200))
         return toga.Box(style=Pack(direction=COLUMN, margin=(0, 12, 24, 12)), children=[
-            self._hint("Ключи создаются прямо на зарубежном сервере и сразу содержат адрес RU-сервера. "
-                       "Данные серверов берутся из раздела «Настройка». Каждому устройству — свой ключ."),
-            self._title("Обычный ключ"),
-            self._field("key_name", "Имя пользователя (так он будет называться в Amnezia)", value="Телефон"),
+            self._hint("Ключи создаются прямо на зарубежном сервере и сразу ведут на RU-сервер. Данные серверов "
+                       "берутся из раздела «Настройка». Каждому устройству — свой ключ."),
+            self._title("Клиент"),
+            self._field("key_name", "Имя клиента (для amneziawg-installer: латиница, цифры, - и _; кириллица "
+                                    "станет латиницей)", value="phone"),
             self.btn_userkey,
-            self._title("Админский ключ"),
+            self.btn_showkey,
+            self._hint("«Показать ключ существующего» — только для amneziawg-installer."),
+            self._title("Админский ключ — только для Amnezia в docker"),
             self._hint("Полный доступ к серверу из приложения Amnezia через SSH-проброс на RU-сервере. "
                        "В ключе root-пароль зарубежного сервера — никому его не отдавай. "
                        "Нужен порт SSH-проброса в «Настройке»."),
@@ -215,7 +221,7 @@ class RelayConnect(toga.App):
 
     def _targets(self):
         """(журнал, строка статуса) текущей операции."""
-        if self._active in ("userkey", "adminkey"):
+        if self._active in KEY_ACTIONS:
             return self.key_log, self.key_status
         return self.log_view, self.status
 
@@ -228,12 +234,13 @@ class RelayConnect(toga.App):
 
     def _set_busy(self, busy: bool):
         self.busy = busy
-        for b in (self.btn_check, self.btn_setup, self.btn_remove, self.btn_userkey, self.btn_adminkey):
+        for b in (self.btn_check, self.btn_setup, self.btn_remove, self.btn_userkey, self.btn_showkey,
+                  self.btn_adminkey):
             b.enabled = not busy
         if busy:
             self._targets()[1].text = "Работаю… не закрывай приложение"
 
-    async def _start(self, action: str):
+    async def _start(self, action: str, clear_log: bool = True):
         if self.busy:
             return
         try:
@@ -256,7 +263,8 @@ class RelayConnect(toga.App):
                 return
         self._save_settings()
         self._active = action
-        self._targets()[0].value = ""
+        if clear_log:
+            self._targets()[0].value = ""
         self._set_busy(True)
         threading.Thread(target=self._worker, args=(action, params, self._val("key_name")), daemon=True).start()
 
@@ -266,11 +274,20 @@ class RelayConnect(toga.App):
             if action == "check":
                 core.run_check(params, self.log)
             elif action == "setup":
+                try:
+                    result, _ = core.run_setup(params, self.log)
+                except core.AwgMissing as e:
+                    self.log(str(e), "warn")
+                    result = e
+            elif action == "install":
+                core.install_awg(params, self.log)
                 result, _ = core.run_setup(params, self.log)
             elif action == "remove":
                 core.run_remove(params, self.log)
             elif action == "userkey":
                 result = keys.create_user_key(params, key_name, self.log)
+            elif action == "showkey":
+                result = keys.get_user_key(params, key_name, self.log)
             elif action == "adminkey":
                 result = keys.build_admin_key(params, params.ssh_forward, self.log)
         except core.RelayError as e:
@@ -288,23 +305,27 @@ class RelayConnect(toga.App):
             if status.text.startswith("Работаю"):
                 status.text = "Relay удалён" if action == "remove" else "Готово"
             return
-        if action == "setup":
+        if isinstance(result, core.AwgMissing):
+            status.text = "AmneziaWG на зарубежном сервере не найден"
+            self.loop.create_task(self._ask_install(result))
+            return
+        if action in ("setup", "install"):
             status.text = f"Готово. Новый адрес для клиентов: {result}"
             self.inputs["new_host"].value = result
             self.loop.create_task(self.main_window.dialog(toga.InfoDialog(
                 "Готово", f"Relay настроен.\nНовый адрес для клиентов: {result}\n\n"
                           "Новые ключи для устройств выдаются в разделе «Ключи».")))
-        elif action == "userkey":
-            self.user_key = result
-            self.key_out.value = result.vpn
-            self.key_conf_btn.enabled = True
-            self.key_conf_btn.text = "Показать как .conf"
-            status.text = f"✔ Ключ «{result.name}» готов ({result.ip})"
         elif action == "adminkey":
             self.user_key = None
             self.key_out.value = result
             self.key_conf_btn.enabled = False
             status.text = "✔ Админский ключ готов — никому его не отдавай"
+        elif action in KEY_ACTIONS:
+            self.user_key = result
+            self.key_out.value = result.vpn or result.conf
+            self.key_conf_btn.enabled = bool(result.vpn)
+            self.key_conf_btn.text = "Показать как .conf"
+            status.text = f"✔ Ключ «{result.name}» готов ({result.ip})"
 
     async def on_check(self, widget, **kwargs):
         await self._start("check")
@@ -318,11 +339,18 @@ class RelayConnect(toga.App):
     async def on_userkey(self, widget, **kwargs):
         await self._start("userkey")
 
+    async def on_showkey(self, widget, **kwargs):
+        await self._start("showkey")
+
     async def on_adminkey(self, widget, **kwargs):
         await self._start("adminkey")
 
+    async def _ask_install(self, e: core.AwgMissing):
+        if await self.main_window.dialog(toga.QuestionDialog("Установить AmneziaWG?", core.install_question(e))):
+            await self._start("install", clear_log=False)
+
     async def on_toggle_format(self, widget, **kwargs):
-        if not self.user_key:
+        if not self.user_key or not self.user_key.vpn:
             return
         if self.key_out.value == self.user_key.vpn:
             self.key_out.value = self.user_key.conf

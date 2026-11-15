@@ -5,13 +5,23 @@ Relay Connect — ядро.
     Клиент (Россия) --IPv4--> RU-сервер:PORT --(realm)--IPv6--> зарубежный сервер:PORT (Amnezia)
 
 На RU-сервер ставится realm (лёгкий L4-форвардер TCP/UDP) как systemd-сервис.
-Зарубежный сервер почти не трогаем: только проверяем, что порты Amnezia
-доступны по IPv6, и при необходимости открываем их в фаерволе.
+
+На зарубежном сервере программа сама определяет, как стоит AmneziaWG:
+  - скриптом amneziawg-installer (https://github.com/bivlked/amneziawg-installer): модуль ядра,
+    сервис awg-quick@awg0, конфиг /etc/amnezia/amneziawg/awg0.conf, клиенты и manage_amneziawg.sh
+    в /root/awg. Программа прописывает в настройки установщика (AWG_ENDPOINT) IPv4 RU-сервера,
+    чтобы ключи клиентов вели на relay;
+  - приложением Amnezia (контейнеры amnezia-* в docker). Порты берутся из docker ps;
+  - никак. Тогда программа с согласия пользователя ставит AmneziaWG скриптом amneziawg-installer
+    (install_awg) и продолжает настройку.
+Уже установленный AmneziaWG программа не переустанавливает.
 """
 
 from __future__ import annotations
 
+import base64
 import ipaddress
+import json
 import re
 import shlex
 import time
@@ -59,11 +69,60 @@ net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 """
 
+# amneziawg-installer: пути одинаковые у русской и английской версии
+AWG_DIR = "/root/awg"
+AWG_MANAGE = f"{AWG_DIR}/manage_amneziawg.sh"
+AWG_INIT = f"{AWG_DIR}/awgsetup_cfg.init"      # настройки установщика, строки вида export KEY='value'
+AWG_SERVER_CONF = "/etc/amnezia/amneziawg/awg0.conf"
+AWG_UNIT = "awg-quick@awg0"
+AWG_STATE = f"{AWG_DIR}/setup_state"           # есть, пока установка не закончена: номер следующего шага
+AWG_LOG = f"{AWG_DIR}/install_amneziawg.log"
+INSTALLER_URL = "https://github.com/bivlked/amneziawg-installer"
+INSTALLER_SCRIPT_URL = f"{INSTALLER_URL}/releases/latest/download/install_amneziawg.sh"
+INSTALLER_PATH = "/root/install_amneziawg.sh"
+INSTALLER_OUT = "/root/relay-connect-awg-install.out"   # вывод установщика, который программа читает
+# --allow-ipv6: иначе установщик выключит IPv6, а relay ходит на сервер именно по нему;
+# --keep-packages: не удалять snapd/cloud-init и прочее, что уже стоит на сервере
+INSTALLER_FLAGS = "--yes --no-color --allow-ipv6 --keep-packages"
+INSTALLER_OS = {("ubuntu", "24.04"), ("ubuntu", "26.04"), ("debian", "12"), ("debian", "13")}
+INSTALL_TIMEOUT = 90 * 60
+# строка sysctl, которой установщик (по умолчанию, без --allow-ipv6) выключает IPv6 на сервере
+IPV6_OFF_RE = r"^[[:space:]]*net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$"
+
 Log = Callable[[str, str], None]   # (сообщение, уровень: info/ok/warn/err/step)
 
 
 class RelayError(Exception):
     """Ошибка, понятная пользователю."""
+
+
+class AwgMissing(RelayError):
+    """На зарубежном сервере нет AmneziaWG (или установка не закончена): можно поставить install_awg."""
+
+    def __init__(self, step: str = ""):
+        self.step = step   # "" = ничего не стоит; иначе шаг, на котором остановился amneziawg-installer
+        if step:
+            msg = (f"На зарубежном сервере не закончена установка amneziawg-installer (остановилась перед шагом "
+                   f"{step}, лог: {AWG_LOG}).")
+        else:
+            msg = ("На зарубежном сервере не найден AmneziaWG: нет ни amneziawg-installer "
+                   f"({AWG_SERVER_CONF}), ни контейнеров Amnezia в docker.")
+        super().__init__(msg)
+
+
+def install_question(e: AwgMissing) -> str:
+    """Текст вопроса перед установкой — одинаковый в настольной и мобильной версии."""
+    head = (f"Установка amneziawg-installer на зарубежном сервере не закончена (следующий шаг {e.step}). "
+            "Продолжить её?" if e.step else
+            "На зарубежном сервере не найден AmneziaWG. Поставить его скриптом amneziawg-installer?")
+    return (head + "\n\n"
+            "Что произойдёт на зарубежном сервере:\n"
+            "• обновятся пакеты системы, сервер два раза перезагрузится; всё займёт 10–30 минут;\n"
+            "• включится фаервол UFW: входящие подключения закрыты, кроме SSH и порта AmneziaWG; "
+            "поставится Fail2Ban;\n"
+            "• IPv6 останется включённым, ключи клиентов сразу будут вести на RU-сервер.\n\n"
+            "Подходят Ubuntu 24.04/26.04 и Debian 12/13. Если на сервере работает что-то ещё, "
+            "UFW может закрыть к нему доступ. После установки программа сама продолжит настройку relay.")
 
 
 # --------------------------------------------------------------------------- #
@@ -95,7 +154,8 @@ class Params:
     ru: ServerCreds
     foreign: ServerCreds          # host = IPv6
     ports: list[PortSpec] = field(default_factory=list)  # пусто = автоопределение
-    ssh_forward: int | None = None  # порт на RU для SSH к зарубежному серверу (админский ключ); None = не нужен
+    ssh_forward: int | None = None  # порт на RU для SSH к зарубежному серверу (и админского ключа Amnezia
+                                    # в docker); None = не нужен
 
 
 def parse_ports(text: str) -> list[PortSpec]:
@@ -240,7 +300,10 @@ def connect_foreign(creds: ServerCreds, ru: Remote, log: Log) -> Remote:
             f"  через RU: {jump_err}\n  напрямую: {e}\n"
             "Проверь: у зарубежного VPS реально есть IPv6 (в панели хостера), sshd слушает IPv6, "
             "у RU-сервера есть рабочий IPv6 (`ping -6 google.com`), на RU-сервере в sshd не выключен "
-            "AllowTcpForwarding."
+            "AllowTcpForwarding.\n"
+            "Если AmneziaWG ставился через amneziawg-installer без флага --allow-ipv6, установщик выключил "
+            "IPv6 на зарубежном сервере. Как включить обратно: docs/DOCUMENTATION.md, раздел «Подготовка "
+            "зарубежного сервера»."
         ) from None
     r = Remote("DE", c, log)
     _require_root(r)
@@ -281,10 +344,44 @@ def listeners(r: Remote, proto: str) -> list[tuple[str, int, str]]:
     return res
 
 
-def detect_amnezia_ports(de: Remote, log: Log) -> list[PortSpec]:
+# --------------------------------------------------------------------------- #
+#  Как стоит AmneziaWG на зарубежном сервере
+# --------------------------------------------------------------------------- #
+
+def docker_amnezia(de: Remote) -> list[str]:
+    """Имена запущенных контейнеров Amnezia (приложение Amnezia ставит их как amnezia-*)."""
     if not de.has("docker"):
-        raise RelayError("На зарубежном сервере нет docker — не могу сам найти порты Amnezia. "
-                         "Впиши порты вручную (например 51820/udp).")
+        return []
+    _, out, _ = de.run("docker ps --format '{{.Names}}' 2>/dev/null")
+    return [n for n in out.split() if n.startswith("amnezia")]
+
+
+def install_state(de: Remote) -> str:
+    """Состояние amneziawg-installer: "done", "none" или номер шага, перед которым он остановился."""
+    _, out, _ = de.run(f"if [ -f {AWG_STATE} ]; then head -c 16 {AWG_STATE}; "
+                       f"elif [ -f {AWG_SERVER_CONF} ] && [ -f {AWG_MANAGE} ]; then echo done; "
+                       # конфиг есть, а скриптов и состояния нет: установщик начнёт заново с шага 1
+                       f"elif [ -f {AWG_SERVER_CONF} ]; then echo 1; else echo none; fi", timeout=30)
+    return out.strip() or "none"
+
+
+def detect_amnezia(de: Remote) -> tuple[str, str]:
+    """("installer" | "docker" | "partial" | "none", шаг установщика для "partial").
+
+    Установщик проверяем первым: на сервере могут остаться и старые контейнеры Amnezia.
+    """
+    state = install_state(de)
+    if state == "done":
+        return "installer", ""
+    if docker_amnezia(de):
+        return "docker", ""
+    if state != "none":
+        return "partial", state
+    return "none", ""
+
+
+def detect_amnezia_ports(de: Remote, log: Log) -> list[PortSpec]:
+    """Порты, которые контейнеры Amnezia публикуют наружу (docker ps)."""
     _, out, _ = de.run("docker ps --format '{{.Names}}\t{{.Ports}}'")
     found: list[PortSpec] = []
     for line in out.splitlines():
@@ -300,6 +397,145 @@ def detect_amnezia_ports(de: Remote, log: Log) -> list[PortSpec]:
         raise RelayError("Не нашёл контейнеров Amnezia с опубликованными портами (docker ps). "
                          "Впиши порты вручную.")
     return found
+
+
+# --------------------------------------------------------------------------- #
+#  AmneziaWG от amneziawg-installer
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class AwgServer:
+    port: int                     # UDP-порт AmneziaWG (ListenPort)
+    endpoint: str                 # AWG_ENDPOINT из awgsetup_cfg.init; "" = установщик сам берёт внешний IPv4
+    clients: list[str]            # имена клиентов (#_Name в awg0.conf)
+    protocol: str                 # поколение протокола (AWG_PROTOCOL), "" если не записано
+    active: bool                  # запущен ли awg-quick@awg0
+    ipv6_off_files: list[str]     # sysctl-файлы, которые выключат IPv6 после перезагрузки
+
+
+def parse_init(text: str) -> dict[str, str]:
+    """awgsetup_cfg.init -> {KEY: value}. Формат как у safe_load_config установщика."""
+    res: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("﻿")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+        if not m:
+            continue
+        value = m.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        res[m.group(1)] = value
+    return res
+
+
+def find_awg(de: Remote, log: Log) -> AwgServer:
+    """Находит AmneziaWG, поставленный amneziawg-installer. Ничего не меняет."""
+    if not de.ok(f"test -f {AWG_SERVER_CONF}"):
+        raise RelayError(f"На зарубежном сервере нет {AWG_SERVER_CONF}: AmneziaWG не установлен через "
+                         f"amneziawg-installer ({INSTALLER_URL}).")
+    if not de.ok(f"test -f {AWG_MANAGE}"):
+        raise RelayError(f"На зарубежном сервере нет {AWG_MANAGE}. Установка amneziawg-installer не "
+                         "завершена: запусти установщик ещё раз, он продолжит с того же шага.")
+
+    _, live, _ = de.run("awg show awg0 listen-port 2>/dev/null")
+    _, conf_port, _ = de.run(f"sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*//p' {AWG_SERVER_CONF} | head -n 1")
+    port_text = (live.strip() or conf_port.strip())
+    if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        raise RelayError(f"Не нашёл ListenPort в {AWG_SERVER_CONF}. Впиши порт вручную, например 39743/udp.")
+
+    _, init_text, _ = de.run(f"cat {AWG_INIT} 2>/dev/null")
+    init = parse_init(init_text)
+    _, names, _ = de.run(f"sed -n 's/^#_Name = //p' {AWG_SERVER_CONF}")
+    _, off, _ = de.run(f"grep -lE {shlex.quote(IPV6_OFF_RE)} /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null")
+
+    srv = AwgServer(
+        port=int(port_text),
+        endpoint=init.get("AWG_ENDPOINT", "").strip(),
+        clients=[n.strip() for n in names.splitlines() if n.strip()],
+        protocol=init.get("AWG_PROTOCOL", ""),
+        active=de.ok(f"systemctl is-active --quiet {AWG_UNIT}"),
+        ipv6_off_files=off.split(),
+    )
+    log(f"AmneziaWG{' ' + srv.protocol if srv.protocol else ''} (amneziawg-installer): порт {srv.port}/udp, "
+        f"клиентов {len(srv.clients)}, адрес в ключах: {srv.endpoint or 'внешний IPv4 сервера (авто)'}", "ok")
+    if not srv.active:
+        log(f"Сервис {AWG_UNIT} не запущен — клиенты не подключатся. На зарубежном сервере: "
+            f"`bash {AWG_MANAGE} check`, после обновления ядра `bash {AWG_MANAGE} repair-module`", "warn")
+    if srv.ipv6_off_files:
+        log("На зарубежном сервере IPv6 выключится после перезагрузки (" + ", ".join(srv.ipv6_off_files) +
+            ": disable_ipv6 = 1, так делает установщик без --allow-ipv6). «Настроить» это исправит.", "warn")
+    return srv
+
+
+def keep_ipv6(de: Remote, srv: AwgServer, log: Log):
+    """Убирает выключение IPv6 из sysctl, иначе relay умрёт при первой перезагрузке зарубежного сервера.
+
+    Правим только строки disable_ipv6 = 1 (меняем на 0) и DISABLE_IPV6 в awgsetup_cfg.init,
+    чтобы повторный запуск установщика не выключил IPv6 снова.
+    """
+    if not srv.ipv6_off_files:
+        return
+    files = " ".join(shlex.quote(f) for f in srv.ipv6_off_files)
+    de.run("sed -i -E 's/^([[:space:]]*net\\.ipv6\\.conf\\.(all|default|lo)\\.disable_ipv6[[:space:]]*="
+           f"[[:space:]]*)1[[:space:]]*$/\\10/' {files}", check=True)
+    de.run(f"test -f {AWG_INIT} && sed -i -E 's/^(export )?DISABLE_IPV6=.*/export DISABLE_IPV6=0/' {AWG_INIT}")
+    srv.ipv6_off_files = []
+    log("Зарубежный сервер: IPv6 больше не выключается при загрузке (disable_ipv6 = 0, DISABLE_IPV6=0)", "ok")
+
+
+def awg_manage(de: Remote, args: str, timeout: int = 600) -> dict:
+    """Запускает manage_amneziawg.sh с --json и возвращает его ответ."""
+    code, out, err = de.run(f"bash {AWG_MANAGE} --json --no-color --yes {args}", timeout=timeout)
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                res = json.loads(line)
+            except json.JSONDecodeError:
+                break
+            if isinstance(res, dict):
+                res.setdefault("rc", code)
+                return res
+            break
+    tail = "\n".join((err.strip() or out.strip()).splitlines()[-15:])
+    raise RelayError(f"manage_amneziawg.sh {args}: не понял ответ (код {code}).\n{tail}")
+
+
+def point_clients_to_relay(de: Remote, srv: AwgServer, ru_ip: str, log: Log):
+    """Прописывает IPv4 RU-сервера в AWG_ENDPOINT и перевыпускает файлы клиентов.
+
+    После этого `manage add`/`regen` сами пишут в ключи Endpoint = RU-сервер, а AllowedIPs
+    исключают именно адрес RU-сервера (иначе awg-quick на Linux завернёт в туннель пакеты к relay).
+    """
+    if srv.endpoint == ru_ip:
+        log(f"Ключи клиентов уже ведут на RU-сервер {ru_ip}", "ok")
+        return
+    if not de.ok(f"test -f {AWG_INIT}"):
+        raise RelayError(f"На зарубежном сервере нет {AWG_INIT}: установка amneziawg-installer не завершена")
+    # копия настроек до первого изменения (cp -n не перезапишет её при повторной настройке)
+    de.run(f"cp -n {AWG_INIT} {AWG_INIT}.relay-connect.bak")
+    line = f"export AWG_ENDPOINT='{ru_ip}'"
+    de.run(f"if grep -qE '^(export )?AWG_ENDPOINT=' {AWG_INIT}; then "
+           f"sed -i -E \"s/^(export )?AWG_ENDPOINT=.*/{line}/\" {AWG_INIT}; "
+           f"else echo \"{line}\" >> {AWG_INIT}; fi", check=True)
+    log(f"Адрес в ключах клиентов: {srv.endpoint or 'авто'} → {ru_ip} (AWG_ENDPOINT в {AWG_INIT}, "
+        f"прежние настройки сохранены в {AWG_INIT}.relay-connect.bak)", "ok")
+    srv.endpoint = ru_ip
+    if not srv.clients:
+        return
+    log(f"Перевыпускаю файлы {len(srv.clients)} клиентов с адресом RU-сервера (manage regen)…", "info")
+    res = awg_manage(de, "regen")
+    failed = [r.get("name", "?") for r in res.get("results", []) if r.get("status") != "regenerated"]
+    log(f"Перевыпущено клиентов: {res.get('regenerated', 0)}. Ключи клиентов: "
+        + ", ".join(srv.clients) + ". Их можно получить на вкладке «Ключи» кнопкой «Показать ключ существующего» "
+        "и заново импортировать на устройствах.", "ok" if res.get("ok") else "warn")
+    if not res.get("ok"):
+        log("manage regen завершился с ошибкой" + (f" для: {', '.join(failed)}" if failed else "") +
+            f". Подробности на зарубежном сервере: `bash {AWG_MANAGE} regen`", "warn")
 
 
 def check_foreign(de: Remote, v6: str, ports: list[PortSpec], log: Log) -> list[PortSpec]:
@@ -373,12 +609,15 @@ def open_port(r: Remote, spec: PortSpec, family: int, log: Log):
     p, proto = spec.port, spec.proto
     _, out, _ = r.run("ufw status 2>/dev/null | head -1")
     if "Status: active" in out:
+        # правило установщика (с комментарием «AmneziaWG VPN») не трогаем, если оно уже есть
+        if r.ok(f"ufw show added 2>/dev/null | grep -qE '^ufw allow {p}/{proto}( |$)'"):
+            return
         r.run(f"ufw allow {p}/{proto}", check=True)
         log(f"[{r.name}] ufw: открыт {spec}", "info")
         return
     if r.ok("firewall-cmd --state >/dev/null 2>&1"):
-        # Без --reload: reload у firewalld может снести iptables-правила Docker
-        # и уронить сеть контейнеров Amnezia. Добавляем правило в runtime и в permanent отдельно.
+        # Без --reload: reload у firewalld сбрасывает правила, добавленные в обход него
+        # (NAT AmneziaWG из PostUp, Docker). Добавляем правило в runtime и в permanent отдельно.
         if not r.ok(f"firewall-cmd --query-port={p}/{proto}"):
             r.run(f"firewall-cmd --add-port={p}/{proto}", check=True)
         r.run(f"firewall-cmd --permanent --add-port={p}/{proto}")
@@ -402,7 +641,7 @@ def _persist_rule(r: Remote, ipt: str, rule: str, log: Log):
     """Сохраняет ОДНО правило, не трогая остальное.
 
     Никаких `netfilter-persistent save` / `iptables-save > rules`: они записали бы
-    в файл и динамические правила Docker, которые после перезагрузки задвоятся.
+    в файл и динамические правила (PostUp AmneziaWG, Docker), которые после перезагрузки задвоятся.
     Вместо этого — отдельный oneshot-сервис, который при загрузке добавляет только наше правило.
     """
     unit = f"relay-connect-fw-{'v6' if ipt == 'ip6tables' else 'v4'}"
@@ -559,49 +798,91 @@ def connect_pair(p: Params, log: Log) -> tuple[Remote, Remote, str, str]:
 
 
 def _forward_spec(p: Params, ports: list[PortSpec]) -> PortSpec | None:
-    """Порт SSH-проброса на RU-сервере (для админского ключа) или None."""
+    """Порт SSH-проброса на RU-сервере (SSH к зарубежному серверу через RU) или None."""
     if not p.ssh_forward:
         return None
     spec = PortSpec(p.ssh_forward, "tcp")
     if spec in ports:
-        raise RelayError(f"Порт SSH-проброса {spec} совпадает с портом Amnezia — выбери другой, например 2222")
+        raise RelayError(f"Порт SSH-проброса {spec} совпадает с портом AmneziaWG — выбери другой, например 2222")
     return spec
 
 
-def _prepare(p: Params, log: Log) -> tuple[Remote, Remote, str, str, list[PortSpec]]:
+@dataclass
+class _Ctx:
+    ru: Remote
+    de: Remote
+    ru_ip: str
+    v6: str
+    ports: list[PortSpec]
+    kind: str                     # installer | docker | none (порты вписаны вручную)
+    srv: AwgServer | None         # AmneziaWG от установщика, если программа правит адрес в его ключах
+
+
+def _prepare(p: Params, log: Log) -> _Ctx:
     ru, de, ru_ip, v6 = connect_pair(p, log)
-    ports = p.ports
-    if not ports:
-        log("Ищу порты Amnezia на зарубежном сервере…", "step")
-        ports = detect_amnezia_ports(de, log)
+    try:
+        log("Ищу AmneziaWG на зарубежном сервере…", "step")
+        kind, step = detect_amnezia(de)
+        srv: AwgServer | None = None
+        if kind == "installer":
+            srv = find_awg(de, log)
+            others = docker_amnezia(de)
+            if others:
+                log("На сервере есть и контейнеры Amnezia в docker (" + ", ".join(others) + "). Пробрасываю порт "
+                    "amneziawg-installer; порты контейнеров, если нужны, впиши в поле «Порты» вручную.", "info")
+            ports = p.ports or [PortSpec(srv.port, "udp")]
+            if PortSpec(srv.port, "udp") not in ports:
+                log(f"Порт AmneziaWG {srv.port}/udp не входит в список портов — адрес в ключах клиентов не меняю",
+                    "warn")
+                srv = None
+        elif kind == "docker":
+            log("AmneziaWG поставлен приложением Amnezia (docker): " + ", ".join(docker_amnezia(de)), "ok")
+            ports = p.ports or detect_amnezia_ports(de, log)
+        elif p.ports:
+            # порты вписаны вручную: настраиваем только пересылку, ничего не ставим
+            log(f"{AwgMissing(step)} Порты указаны вручную — настраиваю только пересылку.", "warn")
+            kind, ports = "none", p.ports
+        else:
+            raise AwgMissing(step)
+    except Exception:
+        de.close()
+        ru.close()
+        raise
     log("Порты для проброса: " + ", ".join(map(str, ports)), "info")
-    return ru, de, ru_ip, v6, ports
+    return _Ctx(ru, de, ru_ip, v6, ports, kind, srv)
 
 
 def run_check(p: Params, log: Log) -> bool:
-    ru = de = None
     try:
-        ru, de, _, v6, ports = _prepare(p, log)
+        c = _prepare(p, log)
+    except AwgMissing as e:
+        log(f"{e} Нажми «Настроить» — программа предложит поставить его скриптом amneziawg-installer.", "warn")
+        return False
+    try:
         log("Проверяю зарубежный сервер…", "step")
-        check_foreign(de, v6, ports, log)
+        check_foreign(c.de, c.v6, c.ports, log)
+        if c.srv and c.srv.endpoint != c.ru_ip:
+            log(f"Ключи клиентов сейчас ведут на {c.srv.endpoint or 'внешний IPv4 сервера'}. «Настроить» пропишет "
+                f"{c.ru_ip} в AWG_ENDPOINT и перевыпустит файлы клиентов.", "info")
         log("Проверяю RU-сервер…", "step")
-        fwd = _forward_spec(p, ports)
-        check_ru(ru, v6, ports + ([fwd] if fwd else []), log)
+        fwd = _forward_spec(p, c.ports)
+        check_ru(c.ru, c.v6, c.ports + ([fwd] if fwd else []), log)
         log("Проверка закончена — можно жать «Настроить».", "ok")
         return True
     finally:
-        for r in (de, ru):
-            if r:
-                r.close()
+        c.de.close()
+        c.ru.close()
 
 
 def run_setup(p: Params, log: Log) -> tuple[str, list[PortSpec]]:
-    ru = de = None
+    """Настраивает relay. Если AmneziaWG на зарубежном сервере нет, бросает AwgMissing до любых изменений."""
+    c = _prepare(p, log)
+    ru, de, ru_ip, v6, ports, srv = c.ru, c.de, c.ru_ip, c.v6, c.ports, c.srv
     try:
-        ru, de, ru_ip, v6, ports = _prepare(p, log)
-
         log("Зарубежный сервер: проверка и подготовка…", "step")
         missing = check_foreign(de, v6, ports, log)
+        if srv:
+            keep_ipv6(de, srv, log)
         if missing:
             install_realm(de, log)
             bridge: dict[str, list[tuple[str, str]]] = {"udp": [], "tcp": []}
@@ -623,7 +904,7 @@ def run_setup(p: Params, log: Log) -> tuple[str, list[PortSpec]]:
         for s in ports:
             by_proto[s.proto].append((f"0.0.0.0:{s.port}", f"[{v6}]:{s.port}"))
         if fwd:
-            # SSH-проброс: RU:<fwd> → зарубежный сервер [IPv6]:<его SSH-порт>, для админского ключа Amnezia
+            # SSH-проброс: RU:<fwd> → зарубежный сервер [IPv6]:<его SSH-порт>: управлять им, пока IPv4 заблокирован
             by_proto["tcp"].append((f"0.0.0.0:{fwd.port}", f"[{v6}]:{p.foreign.port}"))
         deploy_realm(ru, by_proto, log)
         for s in ru_ports:
@@ -639,14 +920,25 @@ def run_setup(p: Params, log: Log) -> tuple[str, list[PortSpec]]:
             else:
                 log(f"Проверка SSH-проброса: на порт {fwd.port} не пришёл ответ SSH от зарубежного сервера", "warn")
 
+        if srv:
+            log("Ключи клиентов: адрес RU-сервера…", "step")
+            point_clients_to_relay(de, srv, ru_ip, log)
+
         log("", "info")
-        log(f"ГОТОВО. В клиенте Amnezia замени адрес сервера на {ru_ip} (порты те же: "
-            + ", ".join(map(str, ports)) + "). Новые ключи можно выдать на вкладке «Ключи».", "ok")
+        port_list = ", ".join(map(str, ports))
+        if c.kind == "installer":
+            log(f"ГОТОВО. Клиенты подключаются к {ru_ip} (порты те же: {port_list}). "
+                "Ключи для устройств — на вкладке «Ключи».", "ok")
+        elif c.kind == "none":
+            log(f"ГОТОВО. RU-сервер {ru_ip} пересылает {port_list} на зарубежный сервер: в клиентах укажи адрес "
+                f"{ru_ip} (вкладка «Конфиг клиента»).", "ok")
+        else:
+            log(f"ГОТОВО. В клиенте Amnezia замени адрес сервера на {ru_ip} (порты те же: {port_list}): "
+                "вкладка «Конфиг клиента». Новые ключи можно выдать на вкладке «Ключи».", "ok")
         return ru_ip, ports
     finally:
-        for r in (de, ru):
-            if r:
-                r.close()
+        de.close()
+        ru.close()
 
 
 def run_remove(p: Params, log: Log):
@@ -664,4 +956,201 @@ def run_remove(p: Params, log: Log):
                f"/etc/sysctl.d/99-relay-connect.conf {REALM_BIN}; systemctl daemon-reload")
         log("RU-сервер: relay удалён (правила фаервола, если добавлялись, оставлены).", "ok")
     finally:
+        ru.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Установка AmneziaWG (amneziawg-installer), если на зарубежном сервере его нет
+# --------------------------------------------------------------------------- #
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+INSTALLER_LINE_RE = re.compile(r"^\[[^\]]*\]\s+(INFO|WARN|ERROR|DEBUG):\s?(.*)$")
+
+
+def _installer_line(line: str, log: Log):
+    """Строку лога установщика — в журнал программы. Вывод apt и прочих программ не показываем."""
+    m = INSTALLER_LINE_RE.match(ANSI_RE.sub("", line).rstrip())
+    if not m:
+        return
+    level, text = m.groups()
+    if level == "DEBUG" or not text.strip(" =-!#"):
+        return
+    if text.startswith("###"):
+        log(text.strip(" #"), "info")
+    else:
+        log("  " + text, {"WARN": "warn", "ERROR": "err"}.get(level, "info"))
+
+
+def _check_installer_os(de: Remote, log: Log):
+    _, out, _ = de.run('. /etc/os-release 2>/dev/null; echo "$ID $VERSION_ID $PRETTY_NAME"')
+    os_id, _, rest = out.strip().partition(" ")
+    version, _, pretty = rest.partition(" ")
+    if (os_id, version) not in INSTALLER_OS:
+        raise RelayError(f"На зарубежном сервере {pretty or 'неизвестная ОС'}. amneziawg-installer поддерживает "
+                         "Ubuntu 24.04/26.04 и Debian 12/13. Переустанови ОС сервера в панели хостера или поставь "
+                         "Amnezia через приложение Amnezia (docker) и нажми «Настроить» снова.")
+    log(f"Зарубежный сервер: {pretty} — amneziawg-installer её поддерживает", "ok")
+
+
+def _fetch_installer(de: Remote, log: Log):
+    tmp = f"{INSTALLER_PATH}.download"
+    log("Скачиваю amneziawg-installer на зарубежный сервер…", "info")
+    got = de.ok(f"curl -fsSL --connect-timeout 15 --max-time 120 -o {tmp} {INSTALLER_SCRIPT_URL}", timeout=150) or \
+        de.ok(f"wget -q -T 60 -O {tmp} {INSTALLER_SCRIPT_URL}", timeout=150)
+    if not got:
+        log("Зарубежный сервер не смог скачать установщик с GitHub — качаю на этом ПК. Учти: по ходу установки "
+            "он ещё скачивает свои скрипты с GitHub, без доступа к GitHub установка остановится.", "warn")
+        try:
+            with urllib.request.urlopen(INSTALLER_SCRIPT_URL, timeout=120, context=_ssl_context()) as resp:
+                data = resp.read()
+        except Exception as e:
+            raise RelayError(f"Не удалось скачать amneziawg-installer ни на сервере, ни на ПК: {e}") from None
+        de.write(tmp, data, 0o700)
+    if not de.ok(f"head -n 1 {tmp} | grep -q '^#!' && grep -q amneziawg {tmp}"):
+        de.run(f"rm -f {tmp}")
+        raise RelayError(f"Скачался не установщик, а что-то другое ({INSTALLER_SCRIPT_URL})")
+    de.run(f"mv -f {tmp} {INSTALLER_PATH} && chmod 700 {INSTALLER_PATH}", check=True)
+
+
+def _launch_installer(de: Remote, args: str) -> tuple[int, int]:
+    """Запускает установщик в фоне (setsid nohup): он переживёт обрыв SSH и сам перезагрузит сервер.
+
+    Возвращает (pid, сколько байт вывода было до запуска).
+    """
+    _, out, _ = de.run(f"touch {INSTALLER_OUT}; stat -c %s {INSTALLER_OUT}; cd /root && "
+                       f"setsid nohup bash {INSTALLER_PATH} {args} </dev/null >>{INSTALLER_OUT} 2>&1 & echo $!",
+                       check=True)
+    try:
+        offset, pid = (int(x) for x in out.split()[:2])
+    except ValueError:
+        raise RelayError(f"Не удалось запустить установщик на зарубежном сервере: {out.strip()}") from None
+    return pid, offset
+
+
+def _follow_installer(de: Remote, pid: int, offset: int, deadline: float, log: Log) -> bool:
+    """Показывает вывод установщика, пока он работает. True — связь оборвалась (сервер перезагружается)."""
+    buf = b""
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            code, out, _ = de.run(f"tail -c +{offset + 1} {INSTALLER_OUT} 2>/dev/null | head -c 262144 | base64 -w0; "
+                                  f"echo; kill -0 {pid} 2>/dev/null && echo RUNNING", timeout=40)
+        except Exception:
+            return True
+        if code < 0:          # канал закрылся без кода выхода: sshd остановлен перезагрузкой
+            return True
+        lines = out.splitlines()
+        try:
+            data = base64.b64decode(lines[0]) if lines else b""
+        except ValueError:
+            data = b""
+        offset += len(data)
+        *complete, buf = (buf + data).split(b"\n")
+        for raw in complete:
+            _installer_line(raw.decode("utf-8", "replace"), log)
+        if "RUNNING" not in lines[1:]:
+            if buf:
+                _installer_line(buf.decode("utf-8", "replace"), log)
+            return False
+    raise RelayError(f"Установка идёт дольше {INSTALL_TIMEOUT // 60} минут. Посмотри лог на зарубежном сервере: "
+                     f"{AWG_LOG}")
+
+
+def _wait_reboot(de: Remote, seconds: int = 180) -> bool:
+    """True, когда связь с сервером пропала (началась перезагрузка)."""
+    until = time.time() + seconds
+    while time.time() < until:
+        try:
+            if de.run("true", timeout=15)[0] != 0:
+                return True
+        except Exception:
+            return True
+        time.sleep(5)
+    return False
+
+
+def _reconnect_foreign(p: Params, ru: Remote, log: Log) -> tuple[Remote, Remote]:
+    """Ждёт, пока зарубежный сервер вернётся после перезагрузки, и подключается к нему снова через RU."""
+    until = time.time() + 15 * 60
+    time.sleep(30)
+    while time.time() < until:
+        try:
+            transport = ru.client.get_transport()
+            if not transport or not transport.is_active():
+                ru.close()
+                ru = connect_ru(p.ru, lambda *_: None)
+                ru.client.get_transport().set_keepalive(15)
+            try:
+                chan = ru.client.get_transport().open_channel(
+                    "direct-tcpip", (p.foreign.host, p.foreign.port), ("127.0.0.1", 0), timeout=15)
+                de = Remote("DE", _ssh(p.foreign, sock=chan), log)
+            except paramiko.AuthenticationException:
+                raise
+            except Exception:
+                # как и connect_foreign: если через RU не выходит, пробуем напрямую с ПК
+                de = Remote("DE", _ssh(p.foreign), log)
+            de.client.get_transport().set_keepalive(15)
+            log("Зарубежный сервер снова на связи", "ok")
+            return ru, de
+        except paramiko.AuthenticationException:
+            raise RelayError("Зарубежный сервер после перезагрузки не принял пароль") from None
+        except Exception:
+            time.sleep(10)
+    raise RelayError("Зарубежный сервер не вернулся после перезагрузки за 15 минут. Проверь его в консоли хостера. "
+                     "Когда он загрузится, нажми «Настроить» ещё раз: установка продолжится с того же шага.")
+
+
+def _installer_tail(de: Remote) -> str:
+    _, out, _ = de.run(f"tail -n 15 {AWG_LOG} 2>/dev/null || tail -n 15 {INSTALLER_OUT}")
+    return ANSI_RE.sub("", out).strip()
+
+
+def install_awg(p: Params, log: Log):
+    """Ставит AmneziaWG скриптом amneziawg-installer (или продолжает прерванную установку).
+
+    Установщик сам дважды перезагружает сервер, и после каждой перезагрузки его надо запустить снова:
+    программа ждёт, переподключается через RU-сервер и запускает его с теми же флагами.
+    --endpoint = IPv4 RU-сервера, поэтому ключи клиентов сразу ведут на relay.
+    """
+    ru, de, ru_ip, _ = connect_pair(p, log)
+    try:
+        for r in (ru, de):
+            r.client.get_transport().set_keepalive(15)
+        kind, _ = detect_amnezia(de)
+        if kind in ("installer", "docker"):
+            log("AmneziaWG на зарубежном сервере уже стоит — ставить не нужно", "ok")
+            return
+        log("Установка AmneziaWG (amneziawg-installer) на зарубежный сервер…", "step")
+        _check_installer_os(de, log)
+        _fetch_installer(de, log)
+        args = f"{INSTALLER_FLAGS} --endpoint={ru_ip}"
+        log(f"Запускаю: bash {INSTALLER_PATH} {args}. Это займёт 10–30 минут, сервер два раза перезагрузится. "
+            "Не закрывай программу.", "info")
+        deadline = time.time() + INSTALL_TIMEOUT
+        for _ in range(6):
+            pid, offset = _launch_installer(de, args)
+            lost = _follow_installer(de, pid, offset, deadline, log)
+            if not lost:
+                state = install_state(de)
+                if state == "done":
+                    log("AmneziaWG установлен", "ok")
+                    return
+                if state not in ("2", "3"):
+                    raise RelayError(f"Установщик остановился с ошибкой (следующий шаг: {state}). Последние строки "
+                                     f"лога {AWG_LOG}:\n{_installer_tail(de)}\n\nИсправь причину и нажми «Настроить» "
+                                     "ещё раз: установка продолжится с того же шага.")
+                if not _wait_reboot(de):
+                    raise RelayError("Установщик попросил перезагрузку, но сервер не перезагрузился. Перезагрузи его "
+                                     "(reboot) и нажми «Настроить» ещё раз: установка продолжится.")
+            log("Зарубежный сервер перезагружается, жду его…", "info")
+            de.close()
+            ru, de = _reconnect_foreign(p, ru, log)
+            state = install_state(de)
+            if state == "done":
+                log("AmneziaWG установлен", "ok")
+                return
+            log(f"Продолжаю установку (шаг {state})…", "info")
+        raise RelayError(f"Установщик перезапускался слишком много раз. Лог на зарубежном сервере: {AWG_LOG}")
+    finally:
+        de.close()
         ru.close()
